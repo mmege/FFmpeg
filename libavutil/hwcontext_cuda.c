@@ -30,6 +30,9 @@
 #include "pixfmt.h"
 #include "imgutils.h"
 
+#include <npp.h>
+#include <nppi_color_conversion.h>
+
 typedef struct CUDAFramesContext {
     int shift_width, shift_height;
     int tex_alignment;
@@ -225,6 +228,11 @@ static int cuda_transfer_data(AVHWFramesContext *ctx, AVFrame *dst,
     AVHWDeviceContext *device_ctx = ctx->device_ctx;
     AVCUDADeviceContext    *hwctx = device_ctx->hwctx;
     CudaFunctions             *cu = hwctx->internal->cuda_dl;
+    uint8_t      * const *srcData = src->data;
+    const int              *srcLineSize = src->linesize;
+    CUdeviceptr transData[3] = {0};
+    unsigned int transLinesize[3] = {0};
+    uint8_t sizeOfDataArray = FF_ARRAY_ELEMS(src->data);
 
     CUcontext dummy;
     int i, ret;
@@ -237,20 +245,56 @@ static int cuda_transfer_data(AVHWFramesContext *ctx, AVFrame *dst,
     if (ret < 0)
         return ret;
 
-    for (i = 0; i < FF_ARRAY_ELEMS(src->data) && src->data[i]; i++) {
+    if (dst->format == AV_PIX_FMT_YUV420P)
+    {
+        const char *errString = NULL;
+        long unsigned int dummyPitch;
+
+        for (i = 0; i < 3; i++)
+        {
+            ret = cu->cuMemAllocPitch(&transData[i], &dummyPitch, (i < 1)?src->width:src->width/2, src->height, 16);
+            if (ret != CUDA_SUCCESS)
+            {
+                cu->cuGetErrorString(ret, &errString);
+                av_log(ctx, AV_LOG_ERROR, "Invalid allocate device memory: %s\n", errString);
+                goto exit;
+            }
+            transLinesize[i] = (unsigned int)dummyPitch;
+        }
+        // NppStreamContext streamCtx = {0};
+        // streamCtx.hStream = hwctx->stream;
+
+        ret = nppiNV12ToYUV420_8u_P2P3R((const Npp8u *const *)src->data, src->linesize[0],
+                                        (Npp8u **)transData,
+                                        transLinesize,
+                                        (NppiSize){src->width, src->height});
+
+        if (ret != NPP_SUCCESS)
+        {
+            cu->cuGetErrorString(ret, &errString);
+            av_log(ctx, AV_LOG_ERROR, "CUDA NV12 to YUV420 error: %s\n", errString);
+            goto exit;
+        }
+
+        srcData = (uint8_t *const *)transData;
+        srcLineSize = (const int *)transLinesize;
+        sizeOfDataArray = 3;
+    }
+
+    for (i = 0; i < sizeOfDataArray && srcData[i]; i++) {
         CUDA_MEMCPY2D cpy = {
-            .srcPitch      = src->linesize[i],
+            .srcPitch      = srcLineSize[i],
             .dstPitch      = dst->linesize[i],
-            .WidthInBytes  = FFMIN(src->linesize[i], dst->linesize[i]),
+            .WidthInBytes  = FFMIN(srcLineSize[i], dst->linesize[i]),
             .Height        = src->height >> ((i == 0 || i == 3) ? 0 : priv->shift_height),
         };
 
         if (src->hw_frames_ctx) {
             cpy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-            cpy.srcDevice     = (CUdeviceptr)src->data[i];
+            cpy.srcDevice     = (CUdeviceptr)srcData[i];
         } else {
             cpy.srcMemoryType = CU_MEMORYTYPE_HOST;
-            cpy.srcHost       = src->data[i];
+            cpy.srcHost       = srcData[i];
         }
 
         if (dst->hw_frames_ctx) {
@@ -273,8 +317,12 @@ static int cuda_transfer_data(AVHWFramesContext *ctx, AVFrame *dst,
     }
 
 exit:
-    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+    for(i = 0; i < sizeOfDataArray && transData[i]; i++)
+    {
+        cu->cuMemFree(transData[i]);
+    }
 
+    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
     return 0;
 }
 
